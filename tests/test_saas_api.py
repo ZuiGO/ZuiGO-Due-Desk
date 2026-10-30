@@ -36,6 +36,103 @@ def test_signup_requires_csrf_and_creates_tenant_admin(client):
     assert client.get("/api/customers").status_code == 401
 
 
+def test_login_customer_schedule_policy_and_template_lifecycle(client):
+    signup, csrf = new_account(client, "Lifecycle company", "owner@example.com")
+    assert signup.status_code == 200
+    assert client.post("/auth/logout", headers={"X-CSRF-Token": csrf}).status_code == 200
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
+    login = client.post(
+        "/auth/login",
+        headers={"X-CSRF-Token": csrf},
+        json={"email": "OWNER@EXAMPLE.COM", "password": "a-secure-passphrase-42"},
+    )
+    assert login.status_code == 200
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
+    assert client.post(
+        "/auth/login",
+        headers={"X-CSRF-Token": csrf},
+        json={"email": "owner@example.com", "password": "incorrect-password"},
+    ).status_code == 401
+
+    customer = client.post(
+        "/api/customers",
+        headers={"X-CSRF-Token": csrf},
+        json={"name": "Schedule Customer"},
+    )
+    assert customer.status_code == 200, customer.text
+    customer_id = customer.json()["id"]
+    assert client.put(
+        "/api/settings/channels/sms",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "enabled": True,
+            "provider": "generic",
+            "config": {"gateway_url": "https://sms.example.invalid"},
+        },
+    ).status_code == 200
+    due_date = date.today() + timedelta(days=30)
+    invoice = client.post(
+        f"/api/customers/{customer_id}/invoices",
+        headers={"X-CSRF-Token": csrf},
+        json={"invoice_number": "SCHEDULE-1", "due_amount": "300", "due_date": due_date.isoformat()},
+    )
+    assert invoice.status_code == 200, invoice.text
+    assert invoice.json()["scheduled_reminders"] == 4
+    assert client.get("/api/reminder-policy").json() == {
+        "frequency_days": 3,
+        "max_reminders": 4,
+        "default_reminder_days_before": [3],
+    }
+
+    custom_dates = [date.today() + timedelta(days=5), date.today() + timedelta(days=12)]
+    updated = client.patch(
+        f"/api/customers/{customer_id}/schedule",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "reminder_frequency_days": 5,
+            "reminder_dates": [item.isoformat() for item in custom_dates],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    active_dates = {
+        item["scheduled_at"][:10]
+        for item in client.get("/api/reminders").json()
+        if item["status"] == "scheduled"
+    }
+    assert active_dates == {item.isoformat() for item in custom_dates}
+
+    policy = client.put(
+        "/api/reminder-policy?frequency_days=8&max_reminders=2&default_reminder_days_before=4",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert policy.status_code == 200
+    assert client.get("/api/reminder-policy").json() == {
+        "frequency_days": 8,
+        "max_reminders": 2,
+        "default_reminder_days_before": [4],
+    }
+
+    saved = client.put(
+        "/api/templates",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "channel": "email",
+            "language": "mr",
+            "stage": "reminder",
+            "subject": "Invoice {invoice}",
+            "body": "Hello {name}, {amount} is due.",
+        },
+    )
+    assert saved.status_code == 200
+    assert len(client.get("/api/templates").json()) == 1
+    removed = client.delete(
+        f"/api/templates/{saved.json()['id']}",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert removed.status_code == 200
+    assert client.get("/api/templates").json() == []
+
+
 def test_sample_workbook_shows_repeatable_installment_columns(client):
     import openpyxl
 
@@ -306,3 +403,232 @@ def test_worker_requires_live_mode_and_contact_consent(client, signed_in, monkey
     with app.state.test_sessions() as db:
         assert db.get(ReminderEvent, next_event_id).status == "sent"
     assert asyncio.run(worker.dispatch_once(app.state.test_sessions)) == 0
+
+
+def test_manual_messages_send_through_all_configured_channels(client, signed_in, monkeypatch):
+    client, csrf = signed_in
+    customer = client.post(
+        "/api/customers",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "name": "Manual Send Customer",
+            "contacts": [
+                {
+                    "phone": "+919999999999",
+                    "email": "customer@example.com",
+                    "telegram_chat_id": "chat-123",
+                    "is_primary": True,
+                    "sms_opted_in": True,
+                    "whatsapp_opted_in": True,
+                    "email_opted_in": True,
+                }
+            ],
+            "invoices": [
+                {
+                    "invoice_number": "MANUAL-1",
+                    "total_amount": "250.00",
+                    "due_amount": "250.00",
+                    "due_date": (date.today() + timedelta(days=5)).isoformat(),
+                }
+            ],
+        },
+    )
+    assert customer.status_code == 200, customer.text
+    contact_id = customer.json()["contacts"][0]["id"]
+
+    channel_settings = {
+        "sms": ("generic", {"gateway_url": "https://sms.example.invalid"}, {"api_key": "sms-key"}),
+        "whatsapp": (
+            "meta",
+            {
+                "phone_number_id": "123456",
+                "graph_api_version": "v21.0",
+                "template_name": "payment_reminder",
+                "template_language": "en",
+            },
+            {"access_token": "whatsapp-token"},
+        ),
+        "email": (
+            "smtp",
+            {"host": "smtp.example.invalid", "port": 465, "sender_email": "billing@example.com"},
+            {"username": "billing@example.com", "password": "mail-password"},
+        ),
+        "telegram": ("telegram", {}, {"bot_token": "telegram-token"}),
+    }
+    for channel, (provider, config, secrets) in channel_settings.items():
+        response = client.put(
+            f"/api/settings/channels/{channel}",
+            headers={"X-CSRF-Token": csrf},
+            json={"enabled": True, "provider": provider, "config": config, "secrets": secrets},
+        )
+        assert response.status_code == 200, response.text
+    assert client.put(
+        "/api/settings/live-sending",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True},
+    ).status_code == 200
+
+    calls = []
+
+    async def record_http(*args):
+        calls.append(("http", args))
+
+    def record_smtp(*args):
+        calls.append(("smtp", args))
+
+    monkeypatch.setattr("worker._http_send", record_http)
+    monkeypatch.setattr("worker._smtp_send", record_smtp)
+    messages = {
+        "sms": {"body": "Your balance is due."},
+        "whatsapp": {"body": None},
+        "email": {"subject": "Invoice follow-up", "body": "Your balance is due."},
+        "telegram": {"body": "Your balance is due."},
+    }
+    for channel, message in messages.items():
+        response = client.post(
+            "/api/messages/send",
+            headers={"X-CSRF-Token": csrf},
+            json={"contact_id": contact_id, "channel": channel, **message},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "sent", "channel": channel}
+        assert all(
+            secret not in response.text
+            for secret in ("sms-key", "whatsapp-token", "mail-password", "telegram-token")
+        )
+
+    http_calls = [args for kind, args in calls if kind == "http"]
+    assert [args[0] for args in http_calls] == ["sms", "whatsapp", "telegram"]
+    assert http_calls[0][4:6] == ("+919999999999", "Your balance is due.")
+    assert http_calls[1][4] == "+919999999999"
+    assert http_calls[1][6] == [
+        "Manual Send Customer",
+        "MANUAL-1",
+        f"payment reminder; due {(date.today() + timedelta(days=5)).isoformat()}",
+        "250.00",
+        "",
+    ]
+    assert http_calls[2][4:6] == ("chat-123", "Your balance is due.")
+    smtp_call = next(args for kind, args in calls if kind == "smtp")
+    assert smtp_call[2:] == ("customer@example.com", "Invoice follow-up", "Your balance is due.")
+
+
+def test_manual_send_requires_consent_live_mode_and_enabled_channel(client, signed_in):
+    client, csrf = signed_in
+    created = client.post(
+        "/api/customers",
+        headers={"X-CSRF-Token": csrf},
+        json={"name": "Manual Send Guard", "contacts": [{"phone": "+919999999999"}]},
+    )
+    contact_id = created.json()["contacts"][0]["id"]
+    payload = {"contact_id": contact_id, "channel": "sms", "body": "Please review your balance."}
+
+    response = client.post("/api/messages/send", headers={"X-CSRF-Token": csrf}, json=payload)
+    assert response.status_code == 400
+    assert "consent" in response.json()["detail"].lower()
+
+    with app.state.test_sessions() as db:
+        contact = db.get(Contact, contact_id)
+        contact.sms_opted_in = True
+        db.commit()
+    response = client.post("/api/messages/send", headers={"X-CSRF-Token": csrf}, json=payload)
+    assert response.status_code == 400
+    assert "live customer messaging" in response.json()["detail"].lower()
+
+    assert client.put(
+        "/api/settings/live-sending",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True},
+    ).status_code == 200
+    response = client.post("/api/messages/send", headers={"X-CSRF-Token": csrf}, json=payload)
+    assert response.status_code == 400
+    assert "enable and save" in response.json()["detail"].lower()
+
+
+def test_manual_send_surfaces_provider_errors(client, signed_in, monkeypatch):
+    client, csrf = signed_in
+    created = client.post(
+        "/api/customers",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "name": "Provider Error Customer",
+            "contacts": [{"phone": "+919999999999", "sms_opted_in": True}],
+        },
+    )
+    contact_id = created.json()["contacts"][0]["id"]
+    client.put(
+        "/api/settings/channels/sms",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True, "provider": "generic", "config": {}, "secrets": {}},
+    )
+    client.put(
+        "/api/settings/live-sending",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True},
+    )
+
+    async def fail_send(*args):
+        raise ValueError("provider_rejected_message")
+
+    monkeypatch.setattr("worker._http_send", fail_send)
+    response = client.post(
+        "/api/messages/send",
+        headers={"X-CSRF-Token": csrf},
+        json={"contact_id": contact_id, "channel": "sms", "body": "Hello."},
+    )
+    assert response.status_code == 502
+    assert "provider_rejected_message" in response.json()["detail"]
+
+
+def test_sms_and_meta_requests_use_configured_authorization_credentials(monkeypatch):
+    import asyncio
+
+    import worker
+
+    requests = []
+
+    class Response:
+        status_code = 200
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **_: Client())
+    monkeypatch.setattr(worker, "_validate_public_host", lambda *_: None)
+    asyncio.run(
+        worker._http_send(
+            "sms",
+            "generic",
+            {"gateway_url": "https://sms.example.invalid"},
+            {"api_key": "test-sms-api-key"},
+            "+919999999999",
+            "SMS test",
+        )
+    )
+    asyncio.run(
+        worker._http_send(
+            "whatsapp",
+            "meta",
+            {
+                "phone_number_id": "123456",
+                "graph_api_version": "v21.0",
+                "template_name": "payment_reminder",
+                "template_language": "en",
+            },
+            {"access_token": "test-meta-access-token"},
+            "+919999999999",
+            "",
+            ["Customer", "INV-1", "payment reminder", "100.00", ""],
+        )
+    )
+
+    assert requests[0][1]["headers"]["Authorization"] == "Bearer test-sms-api-key"
+    assert requests[1][1]["headers"]["Authorization"] == "Bearer test-meta-access-token"

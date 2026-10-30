@@ -17,10 +17,11 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Uploa
 from fastapi.responses import FileResponse
 from fastapi.responses import Response
 import httpx
+from argon2.exceptions import VerificationError
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -166,6 +167,13 @@ class ChannelInput(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     secrets: dict[str, str] = Field(default_factory=dict)
     clear_secrets: bool = False
+
+
+class ManualMessageInput(BaseModel):
+    contact_id: int = Field(gt=0)
+    channel: str
+    body: str | None = Field(default=None, max_length=5000)
+    subject: str | None = Field(default=None, max_length=200)
 
 
 class LiveSendingInput(BaseModel):
@@ -646,7 +654,7 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
     if user is not None:
         try:
             valid = PASSWORDS.verify(user.password_hash, payload.password)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, VerificationError):
             valid = False
     if not valid or user is None:
         raise HTTPException(status_code=401, detail="Email or password is incorrect.")
@@ -1098,6 +1106,113 @@ async def test_channel_settings(
     except (OSError, smtplib.SMTPException, httpx.HTTPError) as error:
         raise HTTPException(status_code=502, detail=f"Channel test failed ({type(error).__name__}).") from error
     return {"status": "sent", "channel": channel, "recipient": recipient}
+
+
+@app.post("/api/messages/send", dependencies=[Depends(require_csrf)])
+async def send_manual_message(
+    payload: ManualMessageInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    if payload.channel not in CHANNELS:
+        raise HTTPException(status_code=422, detail="Choose a supported messaging channel.")
+    contact = db.scalar(
+        select(Contact)
+        .options(joinedload(Contact.customer).selectinload(Customer.invoices))
+        .where(Contact.id == payload.contact_id, Contact.tenant_id == user.tenant_id)
+    )
+    if contact is None:
+        raise HTTPException(status_code=404, detail="Contact not found.")
+
+    recipient_fields = {
+        "sms": (contact.sms_opted_in, contact.phone),
+        "whatsapp": (contact.whatsapp_opted_in, contact.phone),
+        "email": (contact.email_opted_in, contact.email),
+        "telegram": (bool(contact.telegram_chat_id), contact.telegram_chat_id),
+    }
+    opted_in, recipient = recipient_fields[payload.channel]
+    if not opted_in or not recipient:
+        raise HTTPException(status_code=400, detail="This contact has no valid destination or applicable recorded consent for the selected channel.")
+    if payload.channel in {"sms", "whatsapp"} and not valid_phone(recipient):
+        raise HTTPException(status_code=400, detail="The contact does not have a valid phone number for the selected channel.")
+    if payload.channel == "email" and not valid_email(recipient):
+        raise HTTPException(status_code=400, detail="The contact does not have a valid email address.")
+
+    tenant = db.get(Tenant, user.tenant_id)
+    if tenant is None or not tenant.live_sending_enabled:
+        raise HTTPException(status_code=400, detail="Enable live customer messaging before sending.")
+    setting = db.scalar(
+        select(ChannelSettings).where(
+            ChannelSettings.tenant_id == user.tenant_id,
+            ChannelSettings.channel == payload.channel,
+        )
+    )
+    if setting is None or not setting.enabled:
+        raise HTTPException(status_code=400, detail="Enable and save this channel before sending.")
+
+    body = (payload.body or "").strip()
+    if payload.channel == "whatsapp" and body:
+        raise HTTPException(status_code=422, detail="WhatsApp sends use the configured provider-approved template, not free-form text.")
+    if payload.channel != "whatsapp" and not body:
+        raise HTTPException(status_code=422, detail="Enter a message before sending.")
+
+    try:
+        from worker import _http_send, _smtp_send
+
+        credentials = decrypt_secrets(setting.encrypted_secrets)
+        if payload.channel == "email":
+            await asyncio.to_thread(
+                _smtp_send,
+                setting.config or {},
+                credentials,
+                recipient,
+                (payload.subject or "").strip() or f"Message from {tenant.name}",
+                body,
+            )
+        elif payload.channel == "whatsapp":
+            invoice = next(
+                (
+                    item
+                    for item in sorted(contact.customer.invoices, key=lambda value: (value.due_date or date.max, value.id))
+                    if item.status == "open" and item.due_amount is not None and item.due_amount > 0
+                ),
+                None,
+            )
+            if invoice is None:
+                raise HTTPException(status_code=400, detail="WhatsApp template sends require an open invoice with a positive balance.")
+            template_params = [
+                contact.customer.name,
+                invoice.invoice_number,
+                f"payment reminder; due {invoice.due_date.isoformat() if invoice.due_date else 'not recorded'}",
+                f"{invoice.due_amount:.2f}",
+                "",
+            ]
+            await _http_send(
+                payload.channel,
+                setting.provider,
+                setting.config or {},
+                credentials,
+                recipient,
+                "",
+                template_params,
+            )
+        else:
+            await _http_send(
+                payload.channel,
+                setting.provider,
+                setting.config or {},
+                credentials,
+                recipient,
+                body,
+            )
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=502, detail=f"Message send failed: {error}") from error
+    except (OSError, smtplib.SMTPException, httpx.HTTPError) as error:
+        raise HTTPException(status_code=502, detail=f"Message send failed ({type(error).__name__}).") from error
+
+    return {"status": "sent", "channel": payload.channel}
 
 
 @app.get("/api/templates")

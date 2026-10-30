@@ -37,9 +37,9 @@ The `.xlsx` importer recognizes customer name/ID, company, location, phone, emai
 ## Current MVP boundaries
 
 - Signup creates one tenant administrator. Email verification, invitations, user management, subscription billing, and SSO are not included yet.
-- Tenant-scoped messaging credentials are encrypted at rest and write-only in the API. Channel settings do not send a test/live message.
+- Tenant-scoped messaging credentials are encrypted at rest and write-only in the API. Channel settings can send a fixed test message to the explicitly configured test recipient. From a customer's contact row, workspace users can manually send SMS, email, and Telegram text; SMS, email, and WhatsApp require recorded contact consent. Manual sends require the channel to be enabled and the tenant's live-send gate to be on.
 - Reminder occurrences are persisted in an idempotent queue. Run a separate worker with `python -m worker`; it only sends when the tenant's live-send gate and channel are enabled, a channel template exists, and the contact has recorded consent. Configure SMS/SMTP host allowlists and production egress restrictions.
-- WhatsApp business-initiated reminders require an approved Meta template or AiSensy campaign configured with its exact provider-side name/locale. App templates do not override provider approval requirements. Payment links and payment reconciliation are not implemented.
+- WhatsApp business-initiated reminders and manual WhatsApp sends use the configured approved Meta template or AiSensy campaign with its exact provider-side name/locale. Manual WhatsApp sends use the first open invoice with a positive balance; free-form text is not sent because provider-approved template rules apply. App templates do not override provider approval requirements. Payment links and payment reconciliation are not implemented.
 - The original `app.py` is the earlier single-process demo. Do not expose it as the hosted multi-tenant service; run `saas_app:app`.
 - Invoices are modeled in the database, but private PDF storage/serving and migration of legacy demo records remain future work.
 
