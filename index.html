@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dues Desk</title>
+<style>
+:root{--bg:#f3f5f7;--sf:#fff;--ink:#14212b;--mut:#5d6b76;--ln:#dde3e8;--ac:#0b5d4b;--acs:#dcefe9;--am:#7a4f00;--ams:#fbefd2;--rs:#a1233b;--rss:#fbe3e8;--bl:#1d4e89;--bls:#e1ecf8;--on:#fff;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#0f161c;--sf:#172129;--ink:#e6edf2;--mut:#9aa9b4;--ln:#2b3943;--ac:#5fc4a8;--acs:#12352d;--am:#e6b655;--ams:#3b2e10;--rs:#f08a9d;--rss:#3d1822;--bl:#8db8ec;--bls:#14283f;--on:#06241d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+.w{max-width:1150px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:26px;margin:0}h2{font-size:17px;margin:0 0 10px}
+.mut,.sm{color:var(--mut)}.sm{font-size:12.5px}
+.top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.card{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:16px;margin-bottom:16px}
+button,.btn{font:inherit;cursor:pointer;border:1px solid var(--ln);background:var(--sf);color:var(--ink);border-radius:8px;padding:6px 13px;text-decoration:none;display:inline-block}
+button:hover{border-color:var(--ac)}.pri{background:var(--ac);color:var(--on);border-color:var(--ac);font-weight:600}
+input[type=number]{font:inherit;width:70px;background:var(--bg);color:var(--ink);border:1px solid var(--ln);border-radius:8px;padding:4px 8px}
+.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.row label{display:flex;gap:6px;align-items:center}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13.5px}
+th{text-align:left;color:var(--mut);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--ln);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid var(--ln);vertical-align:top}td.n{text-align:right;white-space:nowrap}
+.w1{color:var(--am);font-size:12.5px}
+.bd{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12.5px;font-weight:600;background:var(--ln);color:var(--mut)}
+.b{background:var(--bls);color:var(--bl)}.a{background:var(--ams);color:var(--am)}.g{background:var(--acs);color:var(--ac)}.r{background:var(--rss);color:var(--rs)}
+.chip{display:inline-block;border:1px solid var(--ln);border-radius:99px;padding:2px 10px;font-size:12.5px;margin-right:6px}
+.chip.ok{border-color:var(--ac);color:var(--ac)}
+.banner{padding:8px 14px;border-radius:8px;margin-bottom:12px;font-size:14px;background:var(--acs);color:var(--ac)}.banner.live{background:var(--rss);color:var(--rs)}
+details{border-bottom:1px solid var(--ln);padding:7px 0}summary{cursor:pointer}pre{white-space:pre-wrap;font:inherit;background:var(--bg);padding:8px 10px;border-radius:8px;margin:6px 0}
+#lg{max-height:420px;overflow-y:auto}
+</style></head><body><div class="w">
+<div class="top"><div><h1>Dues Desk</h1><div class="mut">Upload dues and invoices. The agent reminds, follows up, and handles replies.</div></div><div id="chips"></div></div>
+<div id="banner"></div>
+
+<div class="card"><h2>1. Upload</h2>
+<div class="row"><label>Excel <input type="file" id="xl" accept=".xlsx"></label><label>Invoice PDFs <input type="file" id="pdfs" accept=".pdf" multiple></label>
+<button class="pri" onclick="extract()">Extract</button><button onclick="sample()">Use sample data</button><a class="btn" href="/sample.xlsx">Download sample Excel</a></div>
+<div class="sm" id="mapped" style="margin-top:8px"></div></div>
+
+<div class="card" id="dc" hidden><h2>2. Review and run</h2>
+<div class="tw"><table><thead><tr><th></th><th>Dealer</th><th class="n">Amount due</th><th>Invoice</th><th>Checks</th><th>Status</th><th class="n">Reminders</th><th class="n">Next in</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
+<div class="row" style="margin-top:12px"><button class="pri" onclick="start()">Start agent on selected dealers</button><button onclick="reset()">Clear</button>
+<span class="sm">Tip: choose a reminder language for each dealer. Copy message or Open WhatsApp generates a considerate message with Groq. WhatsApp opens with the text prefilled; review it and press Send. Demo mode targets your configured test number. Manual sends do not count as agent reminders. AiSensy campaigns use their approved template; use manual WhatsApp for the custom generated wording.</span></div></div>
+
+<div class="card" id="pc" hidden><h2>3. Reminder policy</h2><div class="row" id="pol"></div></div>
+<div class="card" id="lc" hidden><h2>4. Agent activity</h2>
+<div id="lg"></div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const inr=n=>'₹'+Number(n).toLocaleString('en-IN'),sel=new Set(),pendingLanguages=new Map(),languageVersions=new Map(),languageStatus=new Map();let S=null,polDone=false,logKey='',stateRevision=0;
+const J=(p,o)=>fetch(p,o).then(r=>r.json()),post=(p,b)=>J(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+const cls={scheduled:'b',reminded:'b',promised:'a',planned:'a',verifying:'a',paid:'g',disputed:'r',escalated:'r',approval:'r',delivery_failed:'r'};
+async function refresh(){
+ const revision=stateRevision,next=await J('/api/state');
+ if(revision!==stateRevision)return;
+ for(const [id,language] of pendingLanguages){const d=next.dealers.find(x=>x.id===id);if(d)d.language=language}
+ S=next;
+ if(document.activeElement&&document.activeElement.tagName==='SELECT'&&document.activeElement.closest('#tb'))return;
+ render()
+}
+async function extract(){const f=$('#xl').files[0];if(!f)return alert('Choose the Excel file first');const fd=new FormData();fd.append('excel',f);for(const p of $('#pdfs').files)fd.append('invoices',p);try{const r=await fetch('/api/upload',{method:'POST',body:fd}),data=await r.json();if(!r.ok)throw Error(data.detail||`Upload failed (${r.status})`);S=data;init()}catch(e){alert('Excel extraction failed: '+e.message)}}
+async function sample(){S=await post('/api/sample');init()}
+function init(){sel.clear();S.dealers.filter(d=>d.status==='ready').slice(0,2).forEach(d=>sel.add(d.id));render()}
+async function start(){const languages=Object.fromEntries(S.dealers.map(d=>[d.id,d.language||'en']));S=await post('/api/start',{ids:[...sel],languages});render()}
+async function sendNow(i){const d=S.dealers.find(x=>x.id===i);S=await post('/api/send/'+i,{language:d?.language||'en'});render()}
+async function generateMessage(i){const d=S.dealers.find(x=>x.id===i);const r=await fetch('/api/manual-message/'+i,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({language:d?.language||'en'})}),data=await r.json();if(!r.ok)throw Error(data.detail||`Message generation failed (${r.status})`);return data}
+async function copyMessage(i){
+ try{
+  const data=await generateMessage(i);
+  try{if(!navigator.clipboard||!window.isSecureContext)throw Error('Clipboard API unavailable');await navigator.clipboard.writeText(data.message)}
+  catch{const t=document.createElement('textarea');t.value=data.message;t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();const ok=document.execCommand('copy');t.remove();if(!ok)throw Error('Clipboard access was denied')}
+  alert('Reminder generated and copied to clipboard.')
+ }catch(e){alert('Could not generate or copy reminder: '+e.message)}
+}
+async function openWhatsApp(i){
+ const tab=window.open('about:blank','_blank');if(!tab)return alert('Allow pop-ups to open WhatsApp.');
+ try{const data=await generateMessage(i);if(!data.whatsapp_url)throw Error('No valid WhatsApp recipient number is configured for this dealer.');tab.location.href=data.whatsapp_url}
+ catch(e){tab.close();alert('Could not prepare WhatsApp message: '+e.message)}
+}
+async function reset(){S=await post('/api/reset');sel.clear();render()}
+function tog(i,on){on?sel.add(i):sel.delete(i)}
+async function setLanguage(i,language){
+ const revision=(languageVersions.get(i)||0)+1;languageVersions.set(i,revision);stateRevision++;pendingLanguages.set(i,language);
+ const current=S&&S.dealers.find(x=>x.id===i),previousLanguage=current?.language||'en';if(current)current.language=language;
+ const labels={en:'English',hi:'Hindi',mr:'Marathi'};
+ const showStatus=text=>{const el=$(`#language-status-${i}`);if(el)el.textContent=text};
+ languageStatus.set(i,'Saving language…');showStatus('Saving language…');
+ try{
+  const r=await fetch('/api/language/'+i,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({language})}),data=await r.json();
+  if(!r.ok)throw Error(data.detail||`Language update failed (${r.status})`);
+  if(revision!==languageVersions.get(i))return;
+  stateRevision++;
+  pendingLanguages.delete(i);
+  const d=S&&S.dealers.find(x=>x.id===i);if(d)d.language=data.language;
+  languageStatus.set(i,`Saved — next message will be in ${labels[data.language]}.`);showStatus(languageStatus.get(i));
+ }catch(e){
+  if(revision===languageVersions.get(i)){
+   stateRevision++;pendingLanguages.delete(i);
+   languageStatus.set(i,'Could not save language. Please try again.');
+   const d=S&&S.dealers.find(x=>x.id===i);if(d)d.language=previousLanguage;
+   showStatus(languageStatus.get(i));alert('Could not save language: '+e.message);refresh()
+  }
+ }
+}
+async function savePol(){const g=i=>$('#'+i);await post('/api/policy',{pre:g('pre').value,gap:g('gap').value,max:g('max').value,day:g('day').value,maxi:g('maxi').value,wa:g('wa').checked,sms:g('sms').checked,em:g('em').checked,tg:g('tg').checked,inst:g('inst').checked})}
+function render(){
+ if(!S)return;const ch=S.channels,p=S.policy;
+ $('#chips').innerHTML=[['WhatsApp',ch.wa],['SMS',ch.sms],['Email',ch.em],['Telegram',ch.tg]].map(([n,o])=>`<span class="chip ${o?'ok':''}">${n}: ${o?'ready':'not set up'}</span>`).join('');
+ $('#banner').innerHTML=S.demo?'<div class="banner">Demo mode: messages go to your configured test recipients, never to the dealers in the sheet.</div>':'<div class="banner live">LIVE mode: messages go to the dealers’ real contacts.</div>';
+ const x=S.extraction;$('#mapped').textContent=(x?`Read ${x.dealers} dealers from "${x.sheet}" (header row ${x.header_row}). `:'')+(S.mapped.length?'Columns found: '+S.mapped.map(m=>m[0]+' → '+m[1]).join(', '):'');
+ const has=S.dealers.length>0;$('#dc').hidden=$('#pc').hidden=$('#lc').hidden=!has;if(!has)return;
+ $('#tb').innerHTML=S.dealers.map(d=>`<tr><td>${d.status==='ready'?`<input type="checkbox" ${sel.has(d.id)?'checked':''} onchange="tog(${d.id},this.checked)">`:''}</td>
+ <td><b>${esc(d.shop)}</b><div class="sm">${esc(d.name)} · ${esc(d.cid)} · ${esc(d.loc)}</div><label class="sm">Message language <select aria-label="Reminder language for ${esc(d.shop)}" onchange="setLanguage(${d.id},this.value)"><option value="en" ${d.language==='en'?'selected':''}>English</option><option value="hi" ${d.language==='hi'?'selected':''}>Hindi (हिन्दी)</option><option value="mr" ${d.language==='mr'?'selected':''}>Marathi (मराठी)</option></select></label><div class="sm" id="language-status-${d.id}" aria-live="polite">${esc(languageStatus.get(d.id)||'Used for the next reminder')}</div></td>
+ <td class="n">${inr(d.bal)}<div class="sm">${d.inst?'instalment '+d.inst+': '+inr(d.cur):'due '+(d.due_date||'?')}</div></td>
+ <td>${d.has_pdf?'✓ '+esc(d.inv):'<span class="w1">no PDF matched</span>'}</td>
+ <td>${d.flags.filter(f=>!f.startsWith('No invoice')).map(f=>`<div class="w1">${esc(f)}</div>`).join('')||'<span class="sm">All checks passed</span>'}</td>
+ <td><span class="bd ${cls[d.status]||''}">${d.status}</span></td><td class="n">${d.att}/${p.max}</td><td class="n">${d.next_in!=null?d.next_in+' s':''}</td>
+ <td>${['paid','skipped'].includes(d.status)?'':`<button onclick="sendNow(${d.id})">Send now</button><button onclick="copyMessage(${d.id})">Generate &amp; copy</button><button onclick="openWhatsApp(${d.id})">Open WhatsApp</button>`}</td></tr>`).join('');
+ if(!polDone){polDone=true;const n=(i,l,v)=>`<label>${l} <input type="number" id="${i}" value="${v}" min="1" onchange="savePol()"></label>`,c=(i,l,v)=>`<label><input type="checkbox" id="${i}" ${v?'checked':''} onchange="savePol()"> ${l}</label>`;
+  $('#pol').innerHTML=n('pre','Start reminding',p.pre)+'<span class="sm">days before due</span>'+n('gap','Follow up every',p.gap)+'<span class="sm">days</span>'+n('max','Max reminders',p.max)+n('day','1 policy day =',p.day)+'<span class="sm">seconds (demo speed)</span>'+c('wa','Automatic WhatsApp',p.wa)+c('sms','SMS',p.sms)+c('em','Email',p.em)+c('tg','Telegram',p.tg)+c('inst','Allow instalments',p.inst)+n('maxi','up to',p.maxi)}
+ const k=S.log.length+JSON.stringify(S.log[0]||'');if(k!==logKey){logKey=k;
+  $('#lg').innerHTML=S.log.map(e=>`<details><summary><span class="sm">${e.t}</span> <b>${esc(e.shop)}</b> ${esc(e.text)}</summary>${(e.ch||[]).map(c=>`<div class="sm">${esc(c[0])}: ${esc(c[1])}</div>`).join('')}${e.msg?`<pre>${esc(e.msg)}</pre>`:''}${e.ai?`<div class="sm">Agent’s reading of the reply: ${esc(JSON.stringify(e.ai))}</div>`:''}</details>`).join('')||'<div class="sm">Nothing yet. Start the agent above.</div>'}
+}
+refresh();setInterval(refresh,2500);
+</script></body></html>
