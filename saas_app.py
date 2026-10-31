@@ -19,7 +19,7 @@ from fastapi.responses import Response
 import httpx
 from argon2.exceptions import VerificationError
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 from starlette.middleware.sessions import SessionMiddleware
@@ -37,6 +37,7 @@ from models import (
     Customer,
     Installment,
     Invoice,
+    MessageLog,
     MessageTemplate,
     ReminderEvent,
     ReminderPolicy,
@@ -66,6 +67,16 @@ CHANNEL_FIELDS = {
 
 
 TEMPLATE_VARIABLES = {"name", "shop", "invoice", "amount", "due_date", "installment_date", "payment_link"}
+DEFAULT_TEMPLATES = {
+    ("sms", "reminder"): ("", "Hello {name}, invoice {invoice} has {amount} due on {due_date}. Please arrange payment."),
+    ("sms", "installment"): ("", "Hello {name}, installment of {amount} for invoice {invoice} is due on {installment_date}."),
+    ("whatsapp", "reminder"): ("", "Hello {name}, your balance of {amount} for invoice {invoice} is due on {due_date}."),
+    ("whatsapp", "installment"): ("", "Hello {name}, installment of {amount} for invoice {invoice} is due on {installment_date}."),
+    ("email", "reminder"): ("Payment reminder", "Hello {name}, invoice {invoice} has {amount} due on {due_date}. Please arrange payment."),
+    ("email", "installment"): ("Payment reminder", "Hello {name}, installment of {amount} for invoice {invoice} is due on {installment_date}."),
+    ("telegram", "reminder"): ("", "Hello {name}, invoice {invoice} has {amount} due on {due_date}. Please arrange payment."),
+    ("telegram", "installment"): ("", "Hello {name}, installment of {amount} for invoice {invoice} is due on {installment_date}."),
+}
 
 
 @asynccontextmanager
@@ -159,6 +170,21 @@ class CustomerInput(BaseModel):
 class CustomerScheduleInput(BaseModel):
     reminder_frequency_days: int | None = Field(default=None, ge=1, le=365)
     reminder_dates: list[date] = Field(default_factory=list, max_length=50)
+    reminder_days_before: list[int] | None = Field(default=None, min_length=1, max_length=10)
+
+    @field_validator("reminder_days_before")
+    @classmethod
+    def valid_reminder_days_before(cls, values: list[int] | None) -> list[int] | None:
+        if values is None:
+            return None
+        if any(day < 1 or day > 30 for day in values):
+            raise ValueError("Reminder lead days must be between 1 and 30.")
+        return sorted(set(values), reverse=True)
+
+
+class CustomerRiskInput(BaseModel):
+    flagged: bool
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ChannelInput(BaseModel):
@@ -271,7 +297,7 @@ def add_invoice(db: Session, tenant_id: int, customer_id: int, item: InvoiceInpu
     return invoice
 
 
-def serialize_customer(customer: Customer) -> dict[str, Any]:
+def serialize_customer(customer: Customer, reminder_days_before: list[int] | None = None) -> dict[str, Any]:
     invoices = []
     for invoice in customer.invoices:
         invoices.append(
@@ -305,6 +331,10 @@ def serialize_customer(customer: Customer) -> dict[str, Any]:
         "language": customer.language,
         "reminder_frequency_days": customer.reminder_frequency_days,
         "reminder_dates": customer.reminder_dates or [],
+        "reminder_days_before": reminder_days_before or [10, 7, 5],
+        "risk_flagged": customer.risk_flagged,
+        "risk_flag_reason": customer.risk_flag_reason,
+        "risk_flagged_at": customer.risk_flagged_at.isoformat() if customer.risk_flagged_at else None,
         "contacts": [
             {
                 "id": contact.id,
@@ -389,6 +419,32 @@ def header_map(values: tuple[Any, ...]) -> dict[str, int]:
     }
 
 
+def is_summary_row(row: tuple[Any, ...], columns: dict[str, int]) -> bool:
+    summary_labels = {
+        "total",
+        "grand total",
+        "subtotal",
+        "sub total",
+        "totals",
+        "summary",
+        "balance carried forward",
+        "brought forward",
+    }
+    identity_values = [
+        cell(row, columns, key)
+        for key in ("customer", "company", "invoice")
+    ]
+    for value in identity_values:
+        normalized = re.sub(r"[:\s]+$", "", str(value or "").strip().casefold())
+        if normalized in summary_labels:
+            return True
+    return len(header_map(row)) >= 2
+
+
+def imported_consent(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"yes", "true", "1", "y"}
+
+
 def cell(row: tuple[Any, ...], columns: dict[str, int], field: str) -> Any:
     index = columns.get(field)
     return row[index] if index is not None and index < len(row) else None
@@ -413,19 +469,20 @@ def schedule_reminders(db: Session, tenant_id: int, invoice: Invoice) -> int:
     )
     if customer is None or invoice.status != "open":
         return 0
-    policy = db.scalar(
+    customer_policy = db.scalar(
         select(ReminderPolicy).where(
             ReminderPolicy.tenant_id == tenant_id,
             ReminderPolicy.scope_key == f"customer:{customer.id}",
         )
-    ) or db.scalar(
+    )
+    policy = customer_policy or db.scalar(
         select(ReminderPolicy).where(
             ReminderPolicy.tenant_id == tenant_id,
             ReminderPolicy.scope_key == "default",
         )
     )
     frequency = customer.reminder_frequency_days or (policy.frequency_days if policy else 3)
-    lead_days = policy.default_reminder_days_before if policy and policy.default_reminder_days_before else [3]
+    lead_days = policy.default_reminder_days_before if policy and policy.default_reminder_days_before else [10, 7, 5]
     installment_rows = db.scalars(
         select(Installment).where(
             Installment.tenant_id == tenant_id,
@@ -436,13 +493,18 @@ def schedule_reminders(db: Session, tenant_id: int, invoice: Invoice) -> int:
     targets: list[tuple[date, int | None, int]] = []
     if installment_rows:
         for installment in installment_rows:
-            for days_before in installment.reminder_days_before:
+            days_before_values = (
+                customer_policy.default_reminder_days_before
+                if customer_policy and customer_policy.default_reminder_days_before
+                else installment.reminder_days_before
+            )
+            for days_before in days_before_values:
                 targets.append((installment.due_date - timedelta(days=days_before), installment.id, days_before))
     elif customer.reminder_dates:
         targets.extend((date.fromisoformat(day), None, index) for index, day in enumerate(customer.reminder_dates))
     elif invoice.due_date:
-        targets.append((invoice.due_date - timedelta(days=lead_days[0]), None, lead_days[0]))
-        for number in range(1, (policy.max_reminders if policy else 4)):
+        targets.extend((invoice.due_date - timedelta(days=days), None, days) for days in lead_days)
+        for number in range(1, (policy.max_reminders if policy else 4) + 1):
             targets.append((invoice.due_date + timedelta(days=frequency * number), None, number))
     channels = db.scalars(
         select(ChannelSettings).where(
@@ -636,6 +698,17 @@ def signup(payload: SignupRequest, request: Request, db: Session = Depends(get_d
     db.flush()
     user = User(tenant_id=tenant.id, email=email, password_hash=PASSWORDS.hash(payload.password), role="admin")
     db.add(user)
+    for (channel, stage), (subject, body) in DEFAULT_TEMPLATES.items():
+        db.add(
+            MessageTemplate(
+                tenant_id=tenant.id,
+                channel=channel,
+                language="en",
+                stage=stage,
+                subject=subject or None,
+                body=body,
+            )
+        )
     try:
         db.commit()
     except IntegrityError as error:
@@ -700,7 +773,28 @@ def list_customers(user: User = Depends(current_user), db: Session = Depends(get
         .where(Customer.tenant_id == user.tenant_id)
         .order_by(Customer.name)
     ).all()
-    return [serialize_customer(customer) for customer in customers]
+    policies = db.scalars(
+        select(ReminderPolicy).where(
+            ReminderPolicy.tenant_id == user.tenant_id,
+            ReminderPolicy.scope_key != "default",
+        )
+    ).all()
+    default_policy = db.scalar(
+        select(ReminderPolicy).where(
+            ReminderPolicy.tenant_id == user.tenant_id,
+            ReminderPolicy.scope_key == "default",
+        )
+    )
+    default_lead_days = default_policy.default_reminder_days_before if default_policy else [10, 7, 5]
+    lead_days_by_customer = {
+        row.customer_id: row.default_reminder_days_before
+        for row in policies
+        if row.customer_id is not None
+    }
+    return [
+        serialize_customer(customer, lead_days_by_customer.get(customer.id, default_lead_days))
+        for customer in customers
+    ]
 
 
 @app.post("/api/customers", dependencies=[Depends(require_csrf)])
@@ -727,7 +821,16 @@ def create_customer(
         invoice = add_invoice(db, user.tenant_id, customer.id, invoice_data)
         schedule_reminders(db, user.tenant_id, invoice)
     db.commit()
-    return serialize_customer(customer_query(db, user.tenant_id, customer.id))
+    default_policy = db.scalar(
+        select(ReminderPolicy).where(
+            ReminderPolicy.tenant_id == user.tenant_id,
+            ReminderPolicy.scope_key == "default",
+        )
+    )
+    return serialize_customer(
+        customer_query(db, user.tenant_id, customer.id),
+        default_policy.default_reminder_days_before if default_policy else [10, 7, 5],
+    )
 
 
 @app.patch("/api/customers/{customer_id}/schedule", dependencies=[Depends(require_csrf)])
@@ -740,10 +843,64 @@ def update_customer_schedule(
     customer = customer_query(db, user.tenant_id, customer_id)
     customer.reminder_frequency_days = payload.reminder_frequency_days
     customer.reminder_dates = [item.isoformat() for item in payload.reminder_dates]
+    if payload.reminder_days_before is not None:
+        policy = db.scalar(
+            select(ReminderPolicy).where(
+                ReminderPolicy.tenant_id == user.tenant_id,
+                ReminderPolicy.scope_key == f"customer:{customer.id}",
+            )
+        )
+        if policy is None:
+            policy = ReminderPolicy(
+                tenant_id=user.tenant_id,
+                customer_id=customer.id,
+                scope_key=f"customer:{customer.id}",
+            )
+            db.add(policy)
+        policy.default_reminder_days_before = payload.reminder_days_before
     for invoice in customer.invoices:
         rebuild_invoice_schedule(db, user.tenant_id, invoice)
     db.commit()
-    return serialize_customer(customer_query(db, user.tenant_id, customer_id))
+    policy = db.scalar(
+        select(ReminderPolicy).where(
+            ReminderPolicy.tenant_id == user.tenant_id,
+            ReminderPolicy.scope_key == f"customer:{customer.id}",
+        )
+    ) or db.scalar(
+        select(ReminderPolicy).where(
+            ReminderPolicy.tenant_id == user.tenant_id,
+            ReminderPolicy.scope_key == "default",
+        )
+    )
+    return serialize_customer(
+        customer_query(db, user.tenant_id, customer_id),
+        policy.default_reminder_days_before if policy else [10, 7, 5],
+    )
+
+
+@app.patch("/api/customers/{customer_id}/risk", dependencies=[Depends(require_csrf)])
+def update_customer_risk(
+    customer_id: int,
+    payload: CustomerRiskInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    customer = customer_query(db, user.tenant_id, customer_id)
+    customer.risk_flagged = payload.flagged
+    customer.risk_flag_reason = (
+        (payload.reason or "").strip() or "Manually flagged by a workspace user."
+        if payload.flagged
+        else None
+    )
+    if payload.flagged:
+        customer.risk_flagged_at = datetime.now(timezone.utc)
+    db.commit()
+    return {
+        "id": customer.id,
+        "risk_flagged": customer.risk_flagged,
+        "risk_flag_reason": customer.risk_flag_reason,
+        "risk_flagged_at": customer.risk_flagged_at.isoformat() if customer.risk_flagged_at else None,
+    }
 
 
 @app.post("/api/customers/{customer_id}/invoices", dependencies=[Depends(require_csrf)])
@@ -785,14 +942,12 @@ async def import_workbook(
             if not matching:
                 continue
             header_index, _, columns = max(matching, key=lambda match: len(match[2]))
-            rows.extend(
-                {"row_number": index, "values": row, "columns": columns}
-                for index, row in enumerate(
-                    sheet.iter_rows(min_row=header_index + 2, values_only=True),
-                    header_index + 2,
-                )
-                if any(value not in (None, "") for value in row)
-            )
+            for index, row in enumerate(
+                sheet.iter_rows(min_row=header_index + 2, values_only=True),
+                header_index + 2,
+            ):
+                if any(value not in (None, "") for value in row) and not is_summary_row(row, columns):
+                    rows.append({"row_number": index, "values": row, "columns": columns})
             break
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, openpyxl.utils.exceptions.InvalidFileException) as error:
         raise HTTPException(status_code=400, detail=f"Could not read workbook: {error}") from error
@@ -800,12 +955,33 @@ async def import_workbook(
         raise HTTPException(status_code=422, detail="No customer rows found; include a customer or company column.")
 
     created_customers = created_invoices = skipped_rows = 0
+    existing_customer_ids = set(
+        db.scalars(select(Customer.id).where(Customer.tenant_id == user.tenant_id)).all()
+    )
+    existing_contact_ids = set(
+        db.scalars(select(Contact.id).where(Contact.tenant_id == user.tenant_id)).all()
+    )
+    existing_invoice_ids = set(
+        db.scalars(select(Invoice.id).where(Invoice.tenant_id == user.tenant_id)).all()
+    )
+    updated_customer_ids: set[int] = set()
+    updated_contact_ids: set[int] = set()
+    updated_invoice_ids: set[int] = set()
     warnings: list[dict[str, Any]] = []
     for item in rows:
         row, columns, row_number = item["values"], item["columns"], item["row_number"]
         customer_name = str(cell(row, columns, "customer") or cell(row, columns, "company") or "").strip()
         company = str(cell(row, columns, "company") or "").strip() or None
         external_id = str(cell(row, columns, "external_id") or "").strip() or None
+        phone_value = str(cell(row, columns, "phone") or "").strip()
+        email_value = str(cell(row, columns, "email") or "").strip().lower()
+        telegram_value = str(cell(row, columns, "telegram_chat_id") or "").strip()
+        if phone_value and not valid_phone(phone_value):
+            warnings.append({"row": row_number, "message": "Phone number looks invalid and was not saved."})
+            phone_value = ""
+        if email_value and not valid_email(email_value):
+            warnings.append({"row": row_number, "message": "Email address looks invalid and was not saved."})
+            email_value = ""
         if not customer_name:
             skipped_rows += 1
             warnings.append({"row": row_number, "message": "Skipped: customer name and company are both missing."})
@@ -813,16 +989,43 @@ async def import_workbook(
         customer = None
         if external_id:
             customer = db.scalar(
-                select(Customer).where(Customer.tenant_id == user.tenant_id, Customer.external_id == external_id)
+                select(Customer).where(
+                    Customer.tenant_id == user.tenant_id,
+                    func.lower(Customer.external_id) == external_id.casefold(),
+                )
             )
         if customer is None:
             customer = db.scalar(
                 select(Customer).where(
                     Customer.tenant_id == user.tenant_id,
-                    Customer.name == customer_name,
-                    Customer.company == company,
+                    func.lower(func.trim(Customer.name)) == customer_name.casefold(),
+                    (
+                        func.lower(func.trim(Customer.company)) == company.casefold()
+                        if company
+                        else Customer.company.is_(None)
+                    ),
                 )
             )
+        if customer is None and (phone_value or email_value or telegram_value):
+            contact_filters = []
+            if phone_value:
+                contact_filters.append(Contact.phone == phone_value)
+            if email_value:
+                contact_filters.append(func.lower(Contact.email) == email_value)
+            if telegram_value:
+                contact_filters.append(Contact.telegram_chat_id == telegram_value)
+            matching_customer_ids = db.scalars(
+                select(Contact.customer_id)
+                .where(Contact.tenant_id == user.tenant_id, or_(*contact_filters))
+                .distinct()
+            ).all()
+            if len(matching_customer_ids) == 1:
+                customer = db.scalar(
+                    select(Customer).where(
+                        Customer.id == matching_customer_ids[0],
+                        Customer.tenant_id == user.tenant_id,
+                    )
+                )
         if customer is None:
             language = str(cell(row, columns, "language") or "en").strip().lower()
             customer = Customer(
@@ -836,40 +1039,93 @@ async def import_workbook(
             db.add(customer)
             db.flush()
             created_customers += 1
+        else:
+            if external_id and not customer.external_id:
+                customer.external_id = external_id
+            if company:
+                customer.company = company
+            if cell(row, columns, "location"):
+                customer.location = str(cell(row, columns, "location")).strip() or customer.location
+            if cell(row, columns, "customer"):
+                customer.name = customer_name
+            language_value = str(cell(row, columns, "language") or "").strip().lower()
+            if language_value in LANGUAGES:
+                customer.language = language_value
+            if customer.id in existing_customer_ids:
+                updated_customer_ids.add(customer.id)
 
-        phone_value = str(cell(row, columns, "phone") or "").strip()
-        email_value = str(cell(row, columns, "email") or "").strip().lower()
-        telegram_value = str(cell(row, columns, "telegram_chat_id") or "").strip()
-        if phone_value and not valid_phone(phone_value):
-            warnings.append({"row": row_number, "message": "Phone number looks invalid and was not saved."})
-            phone_value = ""
-        if email_value and not valid_email(email_value):
-            warnings.append({"row": row_number, "message": "Email address looks invalid and was not saved."})
-            email_value = ""
-        if phone_value or email_value:
-            duplicate_contact = db.scalar(
-                select(Contact.id).where(
+        contact_filters = []
+        if phone_value:
+            contact_filters.append(Contact.phone == phone_value)
+        if email_value:
+            contact_filters.append(func.lower(Contact.email) == email_value)
+        if telegram_value:
+            contact_filters.append(Contact.telegram_chat_id == telegram_value)
+        contact = None
+        if contact_filters:
+            contact_matches = db.scalars(
+                select(Contact).where(
                     Contact.tenant_id == user.tenant_id,
                     Contact.customer_id == customer.id,
-                    ((Contact.phone == phone_value) if phone_value else (Contact.email == email_value)),
+                    or_(*contact_filters),
                 )
+            ).all()
+            contact = next(
+                (existing for existing in contact_matches if phone_value and existing.phone == phone_value),
+                None,
+            ) or next(
+                (existing for existing in contact_matches if email_value and (existing.email or "").lower() == email_value),
+                None,
+            ) or next(
+                (existing for existing in contact_matches if telegram_value and existing.telegram_chat_id == telegram_value),
+                None,
             )
-            if not duplicate_contact:
-                db.add(
-                    Contact(
-                        tenant_id=user.tenant_id,
-                        customer_id=customer.id,
-                        name=customer_name,
-                        phone=phone_value or None,
-                        email=email_value or None,
-                        telegram_chat_id=telegram_value or None,
-                        is_primary=not customer.contacts,
-                        sms_opted_in=str(cell(row, columns, "sms_opted_in") or "").strip().lower() in {"yes", "true", "1", "y"},
-                        whatsapp_opted_in=str(cell(row, columns, "whatsapp_opted_in") or "").strip().lower() in {"yes", "true", "1", "y"},
-                        email_opted_in=str(cell(row, columns, "email_opted_in") or "").strip().lower() in {"yes", "true", "1", "y"},
-                    )
+        if contact is None and phone_value:
+            phone_digits = re.sub(r"\D", "", phone_value)
+            existing_contacts = db.scalars(
+                select(Contact).where(
+                    Contact.tenant_id == user.tenant_id,
+                    Contact.customer_id == customer.id,
                 )
-                db.flush()
+            ).all()
+            normalized_matches = [
+                existing
+                for existing in existing_contacts
+                if existing.phone and re.sub(r"\D", "", existing.phone) == phone_digits
+            ]
+            if len(normalized_matches) == 1:
+                contact = normalized_matches[0]
+        if contact is None and (phone_value or email_value or telegram_value):
+            contact = Contact(
+                tenant_id=user.tenant_id,
+                customer_id=customer.id,
+                name=customer_name,
+                phone=phone_value or None,
+                email=email_value or None,
+                telegram_chat_id=telegram_value or None,
+                is_primary=not customer.contacts,
+            )
+            db.add(contact)
+            db.flush()
+        elif contact is not None:
+            if customer_name:
+                contact.name = customer_name
+            if phone_value:
+                contact.phone = phone_value
+            if email_value:
+                contact.email = email_value
+            if telegram_value:
+                contact.telegram_chat_id = telegram_value
+            if contact.id in existing_contact_ids:
+                updated_contact_ids.add(contact.id)
+        if contact is not None:
+            for key, attribute in (
+                ("sms_opted_in", "sms_opted_in"),
+                ("whatsapp_opted_in", "whatsapp_opted_in"),
+                ("email_opted_in", "email_opted_in"),
+            ):
+                if key in columns:
+                    setattr(contact, attribute, imported_consent(cell(row, columns, key)))
 
         frequency = cell(row, columns, "frequency")
         if frequency not in (None, ""):
@@ -889,7 +1145,7 @@ async def import_workbook(
 
         invoice_number = str(cell(row, columns, "invoice") or "").strip()
         total = parse_amount(cell(row, columns, "total"))
-        paid = parse_amount(cell(row, columns, "paid")) or Decimal("0")
+        paid = parse_amount(cell(row, columns, "paid"))
         due = parse_amount(cell(row, columns, "due"))
         due_date = parse_date(cell(row, columns, "due_date"))
         if not invoice_number and all(value is None for value in (total, due, due_date)):
@@ -907,24 +1163,22 @@ async def import_workbook(
         invoice = db.scalar(
             select(Invoice).where(
                 Invoice.tenant_id == user.tenant_id,
-                Invoice.invoice_number == invoice_number,
+                func.lower(func.trim(Invoice.invoice_number)) == invoice_number.casefold(),
             )
         )
         if invoice is not None and invoice.customer_id != customer.id:
             warnings.append({"row": row_number, "message": f"Invoice {invoice_number} already belongs to a different customer in this workspace."})
             continue
-        if invoice is not None and not (installment_date and installment_amount and installment_amount > 0):
-            warnings.append({"row": row_number, "message": f"Invoice {invoice_number} already exists and was not duplicated."})
-            continue
         if invoice is None:
+            paid_amount = paid if paid is not None else Decimal("0")
             if due is None and total is not None:
-                due = max(total - paid, Decimal("0"))
+                due = max(total - paid_amount, Decimal("0"))
             invoice = Invoice(
                 tenant_id=user.tenant_id,
                 customer_id=customer.id,
                 invoice_number=invoice_number,
                 total_amount=total,
-                paid_amount=paid,
+                paid_amount=paid_amount,
                 due_amount=due,
                 due_date=due_date,
                 status="needs_review" if total is None and due is None else ("open" if due is None or due > 0 else "paid"),
@@ -932,6 +1186,29 @@ async def import_workbook(
             db.add(invoice)
             db.flush()
             created_invoices += 1
+        else:
+            if total is not None:
+                invoice.total_amount = total
+            if paid is not None:
+                invoice.paid_amount = paid
+            if due is not None:
+                invoice.due_amount = due
+            elif total is not None or paid is not None:
+                invoice.due_amount = max(
+                    (invoice.total_amount or Decimal("0")) - invoice.paid_amount,
+                    Decimal("0"),
+                )
+            if due_date is not None:
+                invoice.due_date = due_date
+            invoice.status = (
+                "needs_review"
+                if invoice.total_amount is None and invoice.due_amount is None
+                else "open"
+                if invoice.due_amount is None or invoice.due_amount > 0
+                else "paid"
+            )
+            if invoice.id in existing_invoice_ids:
+                updated_invoice_ids.add(invoice.id)
 
         if installment_date and installment_amount and installment_amount > 0:
             existing_installments = db.scalars(
@@ -956,11 +1233,14 @@ async def import_workbook(
         elif cell(row, columns, "installment_date") or cell(row, columns, "installment_amount"):
             warnings.append({"row": row_number, "message": "Installment commitment is incomplete; provide both a valid date and positive amount."})
         db.flush()
-        schedule_reminders(db, user.tenant_id, invoice)
+        rebuild_invoice_schedule(db, user.tenant_id, invoice)
     db.commit()
     return {
         "customers_created": created_customers,
+        "customers_updated": len(updated_customer_ids),
+        "contacts_updated": len(updated_contact_ids),
         "invoices_created": created_invoices,
+        "invoices_updated": len(updated_invoice_ids),
         "rows_skipped": skipped_rows,
         "warnings": warnings,
     }
@@ -1151,11 +1431,58 @@ async def send_manual_message(
         raise HTTPException(status_code=400, detail="Enable and save this channel before sending.")
 
     body = (payload.body or "").strip()
+    subject = (payload.subject or "").strip()
+    invoice = next(
+        (
+            item
+            for item in sorted(contact.customer.invoices, key=lambda value: (value.due_date or date.max, value.id))
+            if item.status == "open" and item.due_amount is not None and item.due_amount > 0
+        ),
+        None,
+    )
+    if payload.channel != "whatsapp" and not body:
+        template = db.scalar(
+            select(MessageTemplate).where(
+                MessageTemplate.tenant_id == user.tenant_id,
+                MessageTemplate.channel == payload.channel,
+                MessageTemplate.language == contact.customer.language,
+                MessageTemplate.stage == "reminder",
+            )
+        )
+        if template is None and contact.customer.language != "en":
+            template = db.scalar(
+                select(MessageTemplate).where(
+                    MessageTemplate.tenant_id == user.tenant_id,
+                    MessageTemplate.channel == payload.channel,
+                    MessageTemplate.language == "en",
+                    MessageTemplate.stage == "reminder",
+                )
+            )
+        if template is None:
+            raise HTTPException(status_code=400, detail="Create a reminder template for this channel before using a saved template.")
+        values = {
+            "name": contact.customer.name,
+            "shop": contact.customer.company or contact.customer.name,
+            "invoice": invoice.invoice_number if invoice else "not recorded",
+            "amount": f"{invoice.due_amount:.2f}" if invoice and invoice.due_amount is not None else "not recorded",
+            "due_date": invoice.due_date.isoformat() if invoice and invoice.due_date else "not recorded",
+            "installment_date": "",
+            "payment_link": "",
+        }
+        try:
+            from worker import _render_template
+
+            body = _render_template(template.body, values)
+            subject = subject or _render_template(template.subject or "Payment reminder", values)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="The saved reminder template could not be rendered.") from error
     if payload.channel == "whatsapp" and body:
         raise HTTPException(status_code=422, detail="WhatsApp sends use the configured provider-approved template, not free-form text.")
     if payload.channel != "whatsapp" and not body:
-        raise HTTPException(status_code=422, detail="Enter a message before sending.")
+        raise HTTPException(status_code=422, detail="Enter a message or leave it blank to use the saved reminder template.")
 
+    logged_body = body
+    logged_subject = subject or f"Message from {tenant.name}"
     try:
         from worker import _http_send, _smtp_send
 
@@ -1166,18 +1493,10 @@ async def send_manual_message(
                 setting.config or {},
                 credentials,
                 recipient,
-                (payload.subject or "").strip() or f"Message from {tenant.name}",
+                logged_subject,
                 body,
             )
         elif payload.channel == "whatsapp":
-            invoice = next(
-                (
-                    item
-                    for item in sorted(contact.customer.invoices, key=lambda value: (value.due_date or date.max, value.id))
-                    if item.status == "open" and item.due_amount is not None and item.due_amount > 0
-                ),
-                None,
-            )
             if invoice is None:
                 raise HTTPException(status_code=400, detail="WhatsApp template sends require an open invoice with a positive balance.")
             template_params = [
@@ -1187,6 +1506,10 @@ async def send_manual_message(
                 f"{invoice.due_amount:.2f}",
                 "",
             ]
+            logged_body = (
+                f"Provider-approved template {setting.config.get('template_name') or setting.config.get('campaign_name') or ''}; "
+                f"invoice {invoice.invoice_number}; amount {invoice.due_amount:.2f}."
+            )
             await _http_send(
                 payload.channel,
                 setting.provider,
@@ -1208,11 +1531,84 @@ async def send_manual_message(
     except HTTPException:
         raise
     except (ValueError, RuntimeError) as error:
+        db.add(
+            MessageLog(
+                tenant_id=user.tenant_id,
+                customer_id=contact.customer_id,
+                contact_id=contact.id,
+                channel=payload.channel,
+                direction="manual",
+                status="failed",
+                recipient=recipient,
+                subject=logged_subject if payload.channel == "email" else subject or None,
+                body=logged_body or None,
+                failure_code=str(error)[:200],
+            )
+        )
+        db.commit()
         raise HTTPException(status_code=502, detail=f"Message send failed: {error}") from error
     except (OSError, smtplib.SMTPException, httpx.HTTPError) as error:
+        db.add(
+            MessageLog(
+                tenant_id=user.tenant_id,
+                customer_id=contact.customer_id,
+                contact_id=contact.id,
+                channel=payload.channel,
+                direction="manual",
+                status="failed",
+                recipient=recipient,
+                subject=logged_subject if payload.channel == "email" else subject or None,
+                body=logged_body or None,
+                failure_code=f"provider_{type(error).__name__.lower()}",
+            )
+        )
+        db.commit()
         raise HTTPException(status_code=502, detail=f"Message send failed ({type(error).__name__}).") from error
 
+    db.add(
+        MessageLog(
+            tenant_id=user.tenant_id,
+            customer_id=contact.customer_id,
+            contact_id=contact.id,
+            channel=payload.channel,
+            direction="manual",
+            status="sent",
+            recipient=recipient,
+            subject=logged_subject if payload.channel == "email" else subject or None,
+            body=logged_body or None,
+            sent_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
     return {"status": "sent", "channel": payload.channel}
+
+
+@app.get("/api/messages")
+def list_message_history(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.execute(
+        select(MessageLog, Customer.name)
+        .join(Customer, (Customer.id == MessageLog.customer_id) & (Customer.tenant_id == MessageLog.tenant_id))
+        .where(MessageLog.tenant_id == user.tenant_id)
+        .order_by(MessageLog.created_at.desc(), MessageLog.id.desc())
+        .limit(200)
+    ).all()
+    return [
+        {
+            "id": log.id,
+            "customer_id": log.customer_id,
+            "customer_name": customer_name,
+            "channel": log.channel,
+            "direction": log.direction,
+            "status": log.status,
+            "recipient": log.recipient,
+            "subject": log.subject,
+            "body": log.body,
+            "failure_code": log.failure_code,
+            "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+            "created_at": log.created_at.isoformat(),
+        }
+        for log, customer_name in rows
+    ]
 
 
 @app.get("/api/templates")
@@ -1243,6 +1639,8 @@ def save_template(
 ) -> dict[str, Any]:
     if payload.channel not in CHANNELS or payload.language not in LANGUAGES:
         raise HTTPException(status_code=422, detail="Choose a supported channel and language (English, Hindi, or Marathi).")
+    if payload.stage not in {"reminder", "installment"}:
+        raise HTTPException(status_code=422, detail="Template stage must be reminder or installment.")
     validate_template(payload.body)
     row = db.scalar(
         select(MessageTemplate).where(
@@ -1287,7 +1685,7 @@ def delete_template(
 def save_reminder_policy(
     frequency_days: int = Query(default=3, ge=1, le=365),
     max_reminders: int = Query(default=4, ge=1, le=30),
-    default_reminder_days_before: list[int] = Query(default=[3]),
+    default_reminder_days_before: list[int] = Query(default=[10, 7, 5]),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -1329,7 +1727,7 @@ def get_reminder_policy(user: User = Depends(current_user), db: Session = Depend
     return {
         "frequency_days": row.frequency_days if row else 3,
         "max_reminders": row.max_reminders if row else 4,
-        "default_reminder_days_before": row.default_reminder_days_before if row else [3],
+        "default_reminder_days_before": row.default_reminder_days_before if row else [10, 7, 5],
     }
 
 

@@ -70,6 +70,9 @@ class Customer(Base):
     reminder_frequency_days: Mapped[int | None] = mapped_column(Integer)
     reminder_dates: Mapped[list[str]] = mapped_column(JSON, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    risk_flagged: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    risk_flag_reason: Mapped[str | None] = mapped_column(String(500))
+    risk_flagged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     contacts: Mapped[list["Contact"]] = relationship(back_populates="customer", cascade="all, delete-orphan")
@@ -179,7 +182,7 @@ class ReminderPolicy(Base):
     scope_key: Mapped[str] = mapped_column(String(80), default="default")
     frequency_days: Mapped[int] = mapped_column(Integer, default=3)
     max_reminders: Mapped[int] = mapped_column(Integer, default=4)
-    default_reminder_days_before: Mapped[list[int]] = mapped_column(JSON, default=lambda: [3])
+    default_reminder_days_before: Mapped[list[int]] = mapped_column(JSON, default=lambda: [10, 7, 5])
 
 
 class ChannelSettings(Base):
@@ -248,3 +251,35 @@ class ReminderEvent(Base):
     failure_code: Mapped[str | None] = mapped_column(String(80))
 
     invoice: Mapped[Invoice] = relationship()
+
+
+class MessageLog(Base):
+    __tablename__ = "message_logs"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["tenant_id", "customer_id"],
+            ["customers.tenant_id", "customers.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["contact_id"], ["contacts.id"], ondelete="SET NULL"
+        ),
+        ForeignKeyConstraint(["reminder_event_id"], ["reminder_events.id"], ondelete="SET NULL"),
+        Index("ix_message_logs_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    customer_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    contact_id: Mapped[int | None] = mapped_column(Integer)
+    reminder_event_id: Mapped[int | None] = mapped_column(Integer)
+    channel: Mapped[str] = mapped_column(String(24), nullable=False)
+    direction: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    recipient: Mapped[str | None] = mapped_column(String(320))
+    subject: Mapped[str | None] = mapped_column(String(200))
+    body: Mapped[str | None] = mapped_column(Text)
+    failure_code: Mapped[str | None] = mapped_column(String(200))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

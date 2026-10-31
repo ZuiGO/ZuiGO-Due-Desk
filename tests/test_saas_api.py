@@ -1,8 +1,10 @@
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 
 from sqlalchemy import select
 
+from database import database_url
 from saas_app import app
 from models import ChannelSettings, Contact, Customer, Installment, Invoice, MessageTemplate, ReminderEvent, Tenant, User
 
@@ -15,6 +17,13 @@ def new_account(client, name, email):
         json={"tenant_name": name, "email": email, "password": "a-secure-passphrase-42"},
     )
     return response, client.get("/auth/csrf").json()["csrf_token"]
+
+
+def test_default_database_path_does_not_depend_on_shell_working_directory(monkeypatch, tmp_path):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    expected = f"sqlite:///{(Path(__file__).resolve().parents[1] / 'dues_desk.db').as_posix()}"
+    assert database_url() == expected
 
 
 def test_signup_requires_csrf_and_creates_tenant_admin(client):
@@ -77,11 +86,11 @@ def test_login_customer_schedule_policy_and_template_lifecycle(client):
         json={"invoice_number": "SCHEDULE-1", "due_amount": "300", "due_date": due_date.isoformat()},
     )
     assert invoice.status_code == 200, invoice.text
-    assert invoice.json()["scheduled_reminders"] == 4
+    assert invoice.json()["scheduled_reminders"] == 7
     assert client.get("/api/reminder-policy").json() == {
         "frequency_days": 3,
         "max_reminders": 4,
-        "default_reminder_days_before": [3],
+        "default_reminder_days_before": [10, 7, 5],
     }
 
     custom_dates = [date.today() + timedelta(days=5), date.today() + timedelta(days=12)]
@@ -91,15 +100,29 @@ def test_login_customer_schedule_policy_and_template_lifecycle(client):
         json={
             "reminder_frequency_days": 5,
             "reminder_dates": [item.isoformat() for item in custom_dates],
+            "reminder_days_before": [10, 5],
         },
     )
     assert updated.status_code == 200, updated.text
+    assert updated.json()["reminder_days_before"] == [10, 5]
     active_dates = {
         item["scheduled_at"][:10]
         for item in client.get("/api/reminders").json()
         if item["status"] == "scheduled"
     }
     assert active_dates == {item.isoformat() for item in custom_dates}
+    client.patch(
+        f"/api/customers/{customer_id}/schedule",
+        headers={"X-CSRF-Token": csrf},
+        json={"reminder_frequency_days": 5, "reminder_dates": [], "reminder_days_before": [10, 5]},
+    )
+    active_dates = {
+        item["scheduled_at"][:10]
+        for item in client.get("/api/reminders").json()
+        if item["status"] == "scheduled"
+    }
+    assert (due_date - timedelta(days=10)).isoformat() in active_dates
+    assert (due_date - timedelta(days=5)).isoformat() in active_dates
 
     policy = client.put(
         "/api/reminder-policy?frequency_days=8&max_reminders=2&default_reminder_days_before=4",
@@ -124,13 +147,14 @@ def test_login_customer_schedule_policy_and_template_lifecycle(client):
         },
     )
     assert saved.status_code == 200
-    assert len(client.get("/api/templates").json()) == 1
+    initial_templates = client.get("/api/templates").json()
+    assert len(initial_templates) == 9
     removed = client.delete(
         f"/api/templates/{saved.json()['id']}",
         headers={"X-CSRF-Token": csrf},
     )
     assert removed.status_code == 200
-    assert client.get("/api/templates").json() == []
+    assert saved.json()["id"] not in {item["id"] for item in client.get("/api/templates").json()}
 
 
 def test_sample_workbook_shows_repeatable_installment_columns(client):
@@ -212,7 +236,7 @@ def test_templates_validate_placeholders_and_are_tenant_scoped(client, signed_in
         json={"channel": "sms", "language": "hi", "body": "नमस्ते {name}, बिल {invoice}"},
     )
     assert saved.status_code == 200
-    assert client.get("/api/templates").json()[0]["language"] == "hi"
+    assert any(item["language"] == "hi" for item in client.get("/api/templates").json())
 
 
 def test_incomplete_excel_import_reports_rows_and_schedules_installment_reminders(client, signed_in):
@@ -273,9 +297,181 @@ def test_incomplete_excel_import_reports_rows_and_schedules_installment_reminder
     assert len(client.get("/api/reminders").json()) == event_count
 
 
-def test_channel_test_uses_only_explicit_test_recipient(client, signed_in, monkeypatch):
+def test_excel_reimport_updates_existing_rows_and_skips_summary_and_repeated_headers(client, signed_in):
+    import openpyxl
+
+    client, csrf = signed_in
+    header = ["Customer Name", "Customer ID", "Phone", "Email", "Invoice Number", "Total Amount", "Paid Amount", "Due Date"]
+    due = date.today() + timedelta(days=30)
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(header)
+    sheet.append(["Jaya", "J-1", "+919800000001", "jaya@example.com", "JAYA-1", 1000, 100, due])
+    sheet.append(["Total", None, None, None, "TOTAL", 1000, 100, due])
+    sheet.append(header)
+    content = BytesIO()
+    workbook.save(content)
+
+    first = client.post(
+        "/api/import",
+        headers={"X-CSRF-Token": csrf},
+        files={"workbook": ("dues.xlsx", content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["customers_created"] == 1
+    assert first.json()["invoices_created"] == 1
+    assert len(client.get("/api/customers").json()) == 1
+    customer = client.get("/api/customers").json()[0]
+    assert len(customer["invoices"]) == 1
+    assert customer["invoices"][0]["due_amount"] == "900.00"
+
+    updated_due = due + timedelta(days=1)
+    update_book = openpyxl.Workbook()
+    update_sheet = update_book.active
+    update_sheet.append(header)
+    update_sheet.append(["Jaya Updated", None, "+919800000002", "jaya@example.com", "jaya-1", 1000, 350, updated_due])
+    update_content = BytesIO()
+    update_book.save(update_content)
+    second = client.post(
+        "/api/import",
+        headers={"X-CSRF-Token": csrf},
+        files={"workbook": ("dues.xlsx", update_content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["customers_created"] == 0
+    assert second.json()["invoices_created"] == 0
+    assert second.json()["invoices_updated"] == 1
+    customer = client.get("/api/customers").json()[0]
+    assert customer["name"] == "Jaya Updated"
+    assert len(customer["contacts"]) == 1
+    assert customer["contacts"][0]["phone"] == "+919800000002"
+    assert len(customer["invoices"]) == 1
+    assert customer["invoices"][0]["paid_amount"] == "350.00"
+    assert customer["invoices"][0]["due_amount"] == "650.00"
+    assert customer["invoices"][0]["due_date"] == updated_due.isoformat()
+
+
+def test_manual_send_uses_saved_template_and_is_visible_in_history(client, signed_in, monkeypatch):
+    client, csrf = signed_in
+    created = client.post(
+        "/api/customers",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "name": "Template Customer",
+            "contacts": [{"phone": "+919800000003", "sms_opted_in": True}],
+            "invoices": [{"invoice_number": "TEMPLATE-1", "due_amount": "125", "due_date": (date.today() + timedelta(days=3)).isoformat()}],
+        },
+    )
+    contact_id = created.json()["contacts"][0]["id"]
+    client.put(
+        "/api/settings/channels/sms",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True, "provider": "generic", "config": {"gateway_url": "https://sms.example.invalid"}},
+    )
+    client.put(
+        "/api/settings/live-sending",
+        headers={"X-CSRF-Token": csrf},
+        json={"enabled": True},
+    )
+    saved = client.put(
+        "/api/templates",
+        headers={"X-CSRF-Token": csrf},
+        json={"channel": "sms", "language": "en", "stage": "reminder", "body": "Custom {name}: {amount} for {invoice}."},
+    )
+    assert saved.status_code == 200
+    sent = []
+
+    async def record_send(*args):
+        sent.append(args)
+
+    monkeypatch.setattr("worker._http_send", record_send)
+    response = client.post(
+        "/api/messages/send",
+        headers={"X-CSRF-Token": csrf},
+        json={"contact_id": contact_id, "channel": "sms"},
+    )
+    assert response.status_code == 200, response.text
+    assert sent[0][5] == "Custom Template Customer: 125.00 for TEMPLATE-1."
+    history = client.get("/api/messages")
+    assert history.status_code == 200
+    assert history.json()[0]["status"] == "sent"
+    assert history.json()[0]["body"] == sent[0][5]
+
+
+def test_worker_logs_reminder_and_flags_customer_after_three_overdue_delivery_days(client, signed_in, monkeypatch):
     import asyncio
 
+    import worker
+
+    client, csrf = signed_in
+    tenant_id = client.get("/auth/me").json()["tenant"]["id"]
+    with app.state.test_sessions() as db:
+        tenant = db.get(Tenant, tenant_id)
+        tenant.live_sending_enabled = True
+        db.add(ChannelSettings(tenant_id=tenant_id, channel="sms", enabled=True, config={"gateway_url": "https://sms.example.invalid"}))
+        customer = Customer(tenant_id=tenant_id, name="Overdue Customer", language="en")
+        db.add(customer)
+        db.flush()
+        db.add(Contact(tenant_id=tenant_id, customer_id=customer.id, phone="+919800000004", sms_opted_in=True))
+        invoice = Invoice(
+            tenant_id=tenant_id,
+            customer_id=customer.id,
+            invoice_number="OVERDUE-1",
+            total_amount="300",
+            paid_amount="0",
+            due_amount="300",
+            due_date=date.today() - timedelta(days=10),
+            status="open",
+        )
+        db.add(invoice)
+        db.flush()
+        for index, delivered_day in enumerate((date.today() - timedelta(days=2), date.today() - timedelta(days=1))):
+            db.add(
+                ReminderEvent(
+                    tenant_id=tenant_id,
+                    invoice_id=invoice.id,
+                    channel="sms",
+                    status="sent",
+                    scheduled_at=datetime.combine(delivered_day, datetime.min.time(), timezone.utc),
+                    delivered_at=datetime.combine(delivered_day, datetime.min.time(), timezone.utc),
+                    idempotency_key=f"overdue-sent-{index}",
+                )
+            )
+        queued = ReminderEvent(
+            tenant_id=tenant_id,
+            invoice_id=invoice.id,
+            channel="sms",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            idempotency_key="overdue-final-reminder",
+        )
+        db.add(queued)
+        db.commit()
+        customer_id = customer.id
+
+    async def record_delivery(_):
+        return None
+
+    monkeypatch.setattr(worker, "_deliver", record_delivery)
+    assert asyncio.run(worker.dispatch_once(app.state.test_sessions)) == 1
+    customer = client.get("/api/customers").json()[0]
+    assert customer["id"] == customer_id
+    assert customer["risk_flagged"] is True
+    assert "3 delivered payment reminders" in customer["risk_flag_reason"]
+    history = client.get("/api/messages").json()
+    assert history[0]["direction"] == "reminder"
+    assert history[0]["status"] == "sent"
+    flagged_at = customer["risk_flagged_at"]
+    cleared = client.patch(
+        f"/api/customers/{customer_id}/risk",
+        headers={"X-CSRF-Token": csrf},
+        json={"flagged": False},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["risk_flagged"] is False
+    assert cleared.json()["risk_flagged_at"] == flagged_at
+
+
+def test_channel_test_uses_only_explicit_test_recipient(client, signed_in, monkeypatch):
     import worker
 
     client, csrf = signed_in
@@ -329,7 +525,7 @@ def test_worker_requires_live_mode_and_contact_consent(client, signed_in, monkey
 
     import worker
 
-    client, csrf = signed_in
+    client, _ = signed_in
     tenant_id = client.get("/auth/me").json()["tenant"]["id"]
     with app.state.test_sessions() as db:
         db.add(ChannelSettings(tenant_id=tenant_id, channel="sms", enabled=True, config={"gateway_url": "https://sms.example.invalid"}))
@@ -376,15 +572,15 @@ def test_worker_requires_live_mode_and_contact_consent(client, signed_in, monkey
         tenant.live_sending_enabled = True
         contact = db.scalar(select(Contact).where(Contact.customer_id == customer_id))
         contact.sms_opted_in = True
-        db.add(
-            MessageTemplate(
-                tenant_id=tenant_id,
-                channel="sms",
-                language="en",
-                stage="reminder",
-                body="Hello {name}, {invoice} has {amount} due on {due_date}.",
+        template = db.scalar(
+            select(MessageTemplate).where(
+                MessageTemplate.tenant_id == tenant_id,
+                MessageTemplate.channel == "sms",
+                MessageTemplate.language == "en",
+                MessageTemplate.stage == "reminder",
             )
         )
+        template.body = "Hello {name}, {invoice} has {amount} due on {due_date}."
         next_event = ReminderEvent(
             tenant_id=tenant_id,
             invoice_id=invoice_id,
@@ -567,7 +763,7 @@ def test_manual_send_surfaces_provider_errors(client, signed_in, monkeypatch):
         json={"enabled": True},
     )
 
-    async def fail_send(*args):
+    async def fail_send(*_):
         raise ValueError("provider_rejected_message")
 
     monkeypatch.setattr("worker._http_send", fail_send)
@@ -578,6 +774,10 @@ def test_manual_send_surfaces_provider_errors(client, signed_in, monkeypatch):
     )
     assert response.status_code == 502
     assert "provider_rejected_message" in response.json()["detail"]
+    history = client.get("/api/messages")
+    assert history.status_code == 200
+    assert history.json()[0]["status"] == "failed"
+    assert history.json()[0]["failure_code"] == "provider_rejected_message"
 
 
 def test_sms_and_meta_requests_use_configured_authorization_credentials(monkeypatch):

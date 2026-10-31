@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
@@ -6,7 +7,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
 def database_url() -> str:
-    value = os.getenv("DATABASE_URL", "sqlite:///./dues_desk.db")
+    default_path = Path(__file__).resolve().parent / "dues_desk.db"
+    value = os.getenv("DATABASE_URL", f"sqlite:///{default_path.as_posix()}")
     if value.startswith("postgres://"):
         return "postgresql+psycopg://" + value.removeprefix("postgres://")
     if value.startswith("postgresql://"):

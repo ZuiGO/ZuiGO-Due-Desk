@@ -24,6 +24,7 @@ from models import (
     Customer,
     Installment,
     Invoice,
+    MessageLog,
     MessageTemplate,
     ReminderEvent,
     Tenant,
@@ -181,10 +182,11 @@ async def _http_send(
                 json={"chat_id": recipient, "text": text},
             )
             try:
-                if not response.json().get("ok"):
-                    raise ValueError("telegram_provider_rejected_message")
-            except (ValueError, AttributeError) as error:
+                result = response.json()
+            except ValueError as error:
                 raise ValueError("telegram_provider_invalid_response") from error
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise ValueError("telegram_provider_rejected_message")
         else:
             raise ValueError("unsupported_channel_provider")
         if response.status_code >= 300:
@@ -276,23 +278,25 @@ def _load_delivery(db: Session, event_id: int) -> dict[str, Any] | None:
         raise ValueError("recipient_missing_or_consent_not_recorded")
     language = customer.language if customer.language in {"en", "hi", "mr"} else "en"
     stage = "installment" if installment else "reminder"
-    template = db.scalar(
-        select(MessageTemplate).where(
-            MessageTemplate.tenant_id == event.tenant_id,
-            MessageTemplate.channel == event.channel,
-            MessageTemplate.language == language,
-            MessageTemplate.stage == stage,
-        )
-    )
-    if template is None and installment:
+    template = None
+    template_scopes = [(language, stage)]
+    if installment:
+        template_scopes.append((language, "reminder"))
+    if language != "en":
+        template_scopes.append(("en", stage))
+        if installment:
+            template_scopes.append(("en", "reminder"))
+    for template_language, template_stage in template_scopes:
         template = db.scalar(
             select(MessageTemplate).where(
                 MessageTemplate.tenant_id == event.tenant_id,
                 MessageTemplate.channel == event.channel,
-                MessageTemplate.language == language,
-                MessageTemplate.stage == "reminder",
+                MessageTemplate.language == template_language,
+                MessageTemplate.stage == template_stage,
             )
         )
+        if template is not None:
+            break
     if template is None:
         raise ValueError("message_template_missing")
     amount = installment.amount if installment else invoice.due_amount
@@ -312,6 +316,15 @@ def _load_delivery(db: Session, event_id: int) -> dict[str, Any] | None:
         values["amount"],
         values["payment_link"],
     ]
+    rendered_message = _render_template(template.body, values)
+    history_message = rendered_message
+    if event.channel == "whatsapp":
+        provider_template = (
+            (setting.config or {}).get("template_name")
+            or (setting.config or {}).get("campaign_name")
+            or "provider-approved template"
+        )
+        history_message = f"{provider_template}; parameters: {' | '.join(template_params)}"
     return {
         "channel": event.channel,
         "provider": setting.provider,
@@ -319,7 +332,8 @@ def _load_delivery(db: Session, event_id: int) -> dict[str, Any] | None:
         "secrets": decrypt_secrets(setting.encrypted_secrets),
         "recipient": recipient,
         "subject": _render_template(template.subject or "Payment reminder", values),
-        "message": _render_template(template.body, values),
+        "message": rendered_message,
+        "history_message": history_message,
         "template_params": template_params,
     }
 
@@ -361,16 +375,19 @@ async def dispatch_once(session_factory: Callable[..., Session] = SessionLocal) 
         event_ids = _claim_due(db, datetime.now(timezone.utc))
 
     for event_id in event_ids:
+        payload = None
         try:
             with session_factory() as db:
                 payload = _load_delivery(db, event_id)
             if payload is None:
                 _failure_with_code(session_factory, event_id, "event_unavailable")
+                _record_reminder_message(session_factory, event_id, None, "event_unavailable")
                 continue
             await _deliver(payload)
         except (ValueError, RuntimeError, httpx.HTTPError, smtplib.SMTPException, OSError) as error:
             code = str(error) if isinstance(error, ValueError) else f"provider_{type(error).__name__.lower()}"
             _failure_with_code(session_factory, event_id, code)
+            _record_reminder_message(session_factory, event_id, payload, code)
         else:
             with session_factory() as db:
                 event = db.get(ReminderEvent, event_id)
@@ -379,6 +396,9 @@ async def dispatch_once(session_factory: Callable[..., Session] = SessionLocal) 
                     event.delivered_at = utcnow()
                     event.claimed_at = None
                     event.failure_code = None
+                    _add_reminder_message(db, event, payload, "sent")
+                    db.flush()
+                    _flag_unresponsive_customer(db, event.tenant_id, event.invoice.customer_id)
                     db.commit()
     return len(event_ids)
 
@@ -386,6 +406,89 @@ async def dispatch_once(session_factory: Callable[..., Session] = SessionLocal) 
 def _failure_with_code(session_factory: Callable[..., Session], event_id: int, code: str) -> None:
     with session_factory() as db:
         _failure(db, event_id, code)
+
+
+def _add_reminder_message(
+    db: Session,
+    event: ReminderEvent,
+    payload: dict[str, Any] | None,
+    status: str,
+    failure_code: str | None = None,
+) -> None:
+    db.add(
+        MessageLog(
+            tenant_id=event.tenant_id,
+            customer_id=event.invoice.customer_id,
+            reminder_event_id=event.id,
+            channel=event.channel,
+            direction="reminder",
+            status=status,
+            recipient=payload.get("recipient") if payload else None,
+            subject=payload.get("subject") if payload else None,
+            body=payload.get("history_message", payload.get("message")) if payload else None,
+            failure_code=failure_code[:200] if failure_code else None,
+            sent_at=utcnow() if status == "sent" else None,
+        )
+    )
+
+
+def _record_reminder_message(
+    session_factory: Callable[..., Session],
+    event_id: int,
+    payload: dict[str, Any] | None,
+    failure_code: str,
+) -> None:
+    with session_factory() as db:
+        event = db.get(ReminderEvent, event_id)
+        if event is not None:
+            _add_reminder_message(db, event, payload, "failed", failure_code)
+            db.commit()
+
+
+def _flag_unresponsive_customer(db: Session, tenant_id: int, customer_id: int) -> None:
+    customer = db.scalar(
+        select(Customer).where(Customer.id == customer_id, Customer.tenant_id == tenant_id)
+    )
+    if customer is None or customer.risk_flagged:
+        return
+    today = utcnow().date()
+    overdue_invoices = db.scalars(
+        select(Invoice).where(
+            Invoice.tenant_id == tenant_id,
+            Invoice.customer_id == customer_id,
+            Invoice.status == "open",
+            Invoice.due_amount > 0,
+            Invoice.due_date < today,
+        )
+    ).all()
+    if not overdue_invoices:
+        return
+    invoice_ids = [invoice.id for invoice in overdue_invoices]
+    deliveries = db.execute(
+        select(ReminderEvent.delivered_at, Invoice.due_date)
+        .join(Invoice, Invoice.id == ReminderEvent.invoice_id)
+        .where(
+            ReminderEvent.tenant_id == tenant_id,
+            ReminderEvent.invoice_id.in_(invoice_ids),
+            ReminderEvent.status == "sent",
+            ReminderEvent.delivered_at.is_not(None),
+        )
+    ).all()
+    overdue_delivery_days = {
+        delivered_at.date()
+        for delivered_at, due_date in deliveries
+        if delivered_at is not None
+        and due_date is not None
+        and delivered_at.date() > due_date
+        and (customer.risk_flagged_at is None or delivered_at > customer.risk_flagged_at)
+    }
+    if len(overdue_delivery_days) >= 3:
+        customer.risk_flagged = True
+        customer.risk_flag_reason = (
+            "Automatically flagged after 3 delivered payment reminders on separate days "
+            "while an invoice remained overdue."
+        )
+        customer.risk_flagged_at = utcnow()
 
 
 async def run_worker() -> None:
